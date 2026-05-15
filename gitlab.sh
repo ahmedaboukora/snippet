@@ -15,8 +15,13 @@ export GITLAB_URL GITLAB_TOKEN
 traiter_projet() {
   local id="$1" chemin="$2"
   count() {
-    curl -sI -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$1" \
-      | awk 'BEGIN{IGNORECASE=1} /^x-total:/ {print $2}' | tr -d '\r\n '
+    # GET avec body jeté (-o /dev/null) et headers récupérés (-D -).
+    # On utilise grep -i (portable BSD/GNU) plutôt que awk IGNORECASE
+    # qui est une extension GNU non supportée par BSD awk (macOS).
+    curl -s -o /dev/null -D - -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$1" \
+      | grep -i '^x-total:' \
+      | awk '{print $2}' \
+      | tr -d '\r\n '
   }
   local p u t
   p=$(count "$GITLAB_URL/api/v4/projects/$id/pipelines?per_page=1")
