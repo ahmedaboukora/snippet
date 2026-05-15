@@ -8,34 +8,11 @@
 set -e
 
 PARALLEL="${PARALLEL:-20}"
-export GITLAB_URL GITLAB_TOKEN
-
-# Fonction qui traite UN projet (id + chemin) et affiche une ligne CSV.
-# On l'exporte pour que xargs puisse l'appeler dans des sous-shells.
-traiter_projet() {
-  local id="$1" chemin="$2"
-  count() {
-    # GET avec body jeté (-o /dev/null) et headers récupérés (-D -).
-    # On utilise grep -i (portable BSD/GNU) plutôt que awk IGNORECASE
-    # qui est une extension GNU non supportée par BSD awk (macOS).
-    curl -s -o /dev/null -D - -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$1" \
-      | grep -i '^x-total:' \
-      | awk '{print $2}' \
-      | tr -d '\r\n '
-  }
-  local p u t
-  p=$(count "$GITLAB_URL/api/v4/projects/$id/pipelines?per_page=1")
-  u=$(count "$GITLAB_URL/api/v4/projects/$id/events?action=pushed&per_page=1")
-  t=$(count "$GITLAB_URL/api/v4/projects/$id/repository/tags?per_page=1")
-  echo "$id,$chemin,${p:-0},${u:-0},${t:-0}"
-}
-export -f traiter_projet
+export GITLAB_URL GITLAB_TOKEN  # exportées pour les sous-shells xargs
 
 echo "id,projet,pipelines,push,tags"
 
-# Étape 1 : on liste tous les projets, page par page, et on les envoie
-# sur stdout sous forme "id<TAB>chemin". Cette partie reste séquentielle
-# (la pagination l'est par nature) mais c'est rapide : ~1500 pages seulement.
+# Étape 1 : on liste tous les projets, page par page, sous forme "id<TAB>chemin".
 page=1
 while :; do
   projets=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
@@ -45,12 +22,20 @@ while :; do
   page=$((page + 1))
 done \
 | \
-# Étape 2 : conversion en strings null-terminées + xargs -0 (portable BSD/GNU).
-# Astuce : au lieu de -I {} (qui pose problème sur BSD avec -n 1), on passe
-# l'argument à bash -c via $1. Le "_" devient $0 (nom du script bidon), et
-# chaque ligne lue par xargs devient $1.
+# Étape 2 : workers parallèles. Tout le traitement est INLINE dans bash -c
+# pour éviter le piège des fonctions exportées qui ne traversent pas les bash
+# différents (macOS lance souvent /bin/bash 3.2 dans le sous-shell xargs).
 tr '\n' '\0' \
 | xargs -0 -P "$PARALLEL" -n 1 bash -c '
   IFS=$'"'"'\t'"'"' read -r id chemin <<< "$1"
-  traiter_projet "$id" "$chemin"
+  url="$GITLAB_URL/api/v4/projects/$id"
+  # Fonction count définie LOCALEMENT dans ce sous-shell, pas de propagation.
+  count() {
+    curl -s -o /dev/null -D - -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$1" \
+      | grep -i "^x-total:" | awk "{print \$2}" | tr -d "\r\n "
+  }
+  p=$(count "$url/pipelines?per_page=1")
+  u=$(count "$url/events?action=pushed&per_page=1")
+  t=$(count "$url/repository/tags?per_page=1")
+  echo "$id,$chemin,${p:-0},${u:-0},${t:-0}"
 ' _
