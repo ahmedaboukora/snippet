@@ -42,14 +42,24 @@ while :; do
     --data "$payload" \
     "$GITLAB_URL/api/graphql")
 
+  # Si GraphQL retourne une erreur (complexity, droits, timeout), on l'affiche et on s'arrête.
+  if echo "$reponse" | jq -e '.errors' >/dev/null 2>&1; then
+    echo "Erreur GraphQL :" >&2
+    echo "$reponse" | jq '.errors' >&2
+    exit 1
+  fi
+
   # Pour chaque projet de la page, on sort id, chemin, pipelines, nb tags.
-  # On extrait l'ID numérique depuis le Global ID GraphQL ("gid://gitlab/Project/42").
+  # - `// []` : si nodes est null (page vide), on traite comme un tableau vide
+  # - `// 0`  : si pipelines.count est null (droits ?), on met 0
+  # - `// []` : idem pour tagNames quand le projet n'a pas de repository
+  # - `sub(...) // .id` : si l'ID n'a pas le préfixe attendu, on garde tel quel
   echo "$reponse" | jq -r '
-    .data.projects.nodes[] |
-    [(.id | sub("gid://gitlab/Project/"; "")),
-     .fullPath,
-     .pipelines.count,
-     (.repository.tagNames | length)] |
+    (.data.projects.nodes // [])[] |
+    [((.id // "") | sub("gid://gitlab/Project/"; "")),
+     (.fullPath // ""),
+     (.pipelines.count // 0),
+     ((.repository.tagNames // []) | length)] |
     @tsv' \
   | while IFS=$'\t' read -r id chemin pipelines tags; do
       # Push events en parallèle = un appel REST par projet, mais 20 en simultané.
