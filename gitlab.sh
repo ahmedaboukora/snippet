@@ -40,13 +40,12 @@ while :; do
   page=$((page + 1))
 done \
 | \
-# Étape 2 : on convertit chaque ligne en string null-terminée (\0),
-# puis xargs -0 envoie chaque entrée à un worker bash en parallèle.
-# tr + xargs -0 est portable (macOS BSD et Linux GNU), contrairement à xargs -d.
-# -P : nombre de workers concurrents
-# -n 1 : une entrée par invocation
+# Étape 2 : conversion en strings null-terminées + xargs -0 (portable BSD/GNU).
+# Astuce : au lieu de -I {} (qui pose problème sur BSD avec -n 1), on passe
+# l'argument à bash -c via $1. Le "_" devient $0 (nom du script bidon), et
+# chaque ligne lue par xargs devient $1.
 tr '\n' '\0' \
-| xargs -0 -P "$PARALLEL" -n 1 -I {} bash -c '
-  IFS=$'"'"'\t'"'"' read -r id chemin <<< "{}"
+| xargs -0 -P "$PARALLEL" -n 1 bash -c '
+  IFS=$'"'"'\t'"'"' read -r id chemin <<< "$1"
   traiter_projet "$id" "$chemin"
-'
+' _
