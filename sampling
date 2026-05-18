@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""
+Calibrage d'un test de performance GitLab à partir du payload Service Ping.
+
+OBJECTIF
+--------
+Convertit les volumes hebdomadaires agrégés du payload Service Ping en
+estimations de charge (events/minute) pour 6 events métier :
+  1. Push sur la branche par défaut
+  2. Pipeline de tag
+  3. Event de tag
+  4. Commentaire
+  5. Vulnérabilité (drift)
+  6. Déploiement (promote/demote)
+
+USAGE
+-----
+# 1. Explorer les clés *weekly disponibles dans VOTRE payload
+#    (à faire en premier pour ajuster les patterns si besoin)
+python gitlab_perf_calibration.py payload.json --list-keys
+
+# 2. Calculer les volumes et charges pour les 6 events métier
+python gitlab_perf_calibration.py payload.json
+
+# 3. Analyser une série temporelle (plusieurs semaines collectées)
+python gitlab_perf_calibration.py payload_w1.json payload_w2.json payload_w3.json
+
+# 4. Ajuster les facteurs d'estimation du peak si besoin
+python gitlab_perf_calibration.py payload.json --peak-factor 3 --safety 1.5
+"""
+
+import json
+import argparse
+import re
+import statistics
+from typing import Any
+
+# =============================================================================
+# CONFIGURATION : patterns de recherche des clés par event métier
+# =============================================================================
+#
+# Le payload Service Ping contient des centaines de clés et les noms exacts
+# varient entre versions GitLab. Plutôt que de coder en dur des clés qui
+# pourraient ne pas exister chez vous, on utilise des patterns regex.
+#
+# Règle : pour chaque event, on teste les patterns DANS L'ORDRE et on prend
+# le PREMIER qui donne au moins un résultat. Ça évite le double-comptage
+# si plusieurs patterns matchent.
+#
+# Si aucun pattern ne matche, l'event sera marqué "non trouvé" dans le
+# rapport et vous saurez qu'il faut ajuster ici.
+# =============================================================================
+
+EVENT_PATTERNS = {
+    "push_branche_defaut": [
+        # Pas de compteur direct "push" dans Service Ping.
+        # Approximation : pipelines déclenchés par un push (source = "push").
+        r"ci_pipelines.*pushed.*weekly",
+        r"pipelines.*pushed.*weekly",
+        r"ci_pipelines_pushed.*weekly",
+    ],
+    "pipeline_tag": [
+        # Pipelines déclenchés par un tag.
+        r"ci_pipelines.*tag.*weekly",
+        r"pipelines.*tag.*weekly",
+    ],
+    "tag": [
+        # Création de tags (très souvent absent du payload).
+        r"tags.*created.*weekly",
+        r"projects.*tags.*weekly",
+    ],
+    "commentaire": [
+        # Notes (commentaires sur commits, MR, issues).
+        r"notes.*created.*weekly",
+        r"notes_created.*weekly",
+        r"^counts_weekly\.notes$",
+    ],
+    "vulnerabilite_drift": [
+        # Vulnérabilités détectées (drift de sécurité).
+        r"vulnerabilities.*detected.*weekly",
+        r"vulnerabilities.*weekly",
+        r"vulnerability.*weekly",
+    ],
+    "deployment": [
+        # Déploiements (couvre promote ET demote, à diviser ensuite).
+        r"deployments.*weekly",
+        r"^counts_weekly\.deployments$",
+    ],
+}
+
+# =============================================================================
+# FACTEURS D'ESTIMATION DU PEAK
+# =============================================================================
+#
+# Le payload donne un volume sur 7 JOURS. Pour un test de perf il faut
+# une charge à la MINUTE en pic.
+#
+# On applique 3 facteurs successifs :
+#
+# 1. Concentration heures ouvrées : 168h totales / (5j × 10h) = 3.36
+#    Hypothèse : 80%+ du trafic se concentre en heures ouvrées.
+#
+# 2. Pic intra-jour : x2 typique pour du CI/CD
+#    (push de fin d'après-midi, builds qui s'accumulent)
+#
+# 3. Marge de sécurité : x1.3
+#    Pour couvrir les imprévus et avoir une cible robuste.
+#
+# Total : un facteur peak/moyenne d'environ 8.7×. Ajustable via CLI.
+# =============================================================================
+
+DEFAULT_BUSINESS_HOURS_FACTOR = 3.36
+DEFAULT_PEAK_HOURLY_FACTOR = 2.0
+DEFAULT_SAFETY_FACTOR = 1.3
+
+
+# =============================================================================
+# CHARGEMENT ET APLATISSEMENT DU PAYLOAD
+# =============================================================================
+
+def load_payload(path: str) -> dict:
+    """Charge un payload JSON depuis un fichier local."""
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict[str, Any]:
+    """
+    Aplatit un dict imbriqué en dict plat avec des clés en notation pointée.
+
+    Le payload Service Ping est très imbriqué :
+        { "counts_weekly": { "notes": { "created": 42 } } }
+
+    Aplati ça devient :
+        { "counts_weekly.notes.created": 42 }
+
+    Beaucoup plus simple pour faire des regex de recherche derrière.
+    """
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            # Récursion : on continue à aplatir les sous-dicts.
+            items.extend(flatten_dict(v, new_key, sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
+# =============================================================================
+# RECHERCHE DES CLÉS PAR PATTERN
+# =============================================================================
+
+def find_matching_keys(
+    flat_payload: dict[str, Any], patterns: list[str]
+) -> list[tuple[str, int]]:
+    """
+    Cherche dans le payload aplati les clés qui matchent les regex patterns.
+
+    Stratégie : on teste les patterns DANS L'ORDRE et on retourne dès qu'un
+    pattern donne au moins un résultat. Ça évite que des patterns moins
+    spécifiques (genre 'weekly' tout seul) ne polluent le résultat.
+
+    Retourne une liste de tuples (clé, valeur) avec uniquement des valeurs
+    numériques (les autres types comme bool/str sont filtrés).
+    """
+    for pattern in patterns:
+        regex = re.compile(pattern, re.IGNORECASE)
+        matches = []
+        for key, value in flat_payload.items():
+            # On garde uniquement les valeurs numériques entières.
+            # Le payload contient parfois des valeurs comme "Available"
+            # ou True/False qu'on ne veut pas traiter comme des compteurs.
+            if regex.search(key) and isinstance(value, (int, float)) and not isinstance(value, bool):
+                matches.append((key, int(value)))
+        if matches:
+            return matches
+    return []
+
+
+# =============================================================================
+# CALCUL DES MÉTRIQUES DE CHARGE
+# =============================================================================
+
+def compute_load_metrics(
+    weekly_volume: int,
+    business_factor: float = DEFAULT_BUSINESS_HOURS_FACTOR,
+    peak_factor: float = DEFAULT_PEAK_HOURLY_FACTOR,
+    safety_factor: float = DEFAULT_SAFETY_FACTOR,
+) -> dict[str, float]:
+    """
+    À partir d'un volume HEBDOMADAIRE, calcule plusieurs taux par minute :
+
+    - moyenne_24_7_par_min : taux moyen brut (volume / 10080 minutes par semaine)
+    - moyenne_ouvree_par_min : taux moyen en supposant que tout se passe
+                                en heures ouvrées (5j × 10h = 3000 minutes)
+    - pic_ouvre_par_min : pic intra-jour estimé (moyenne ouvrée × peak_factor)
+    - pic_cible_test_perf_par_min : pic avec marge de sécurité — c'est CE chiffre
+                                     qu'il faut utiliser pour calibrer le test
+    """
+    minutes_per_week = 7 * 24 * 60  # 10 080 minutes dans une semaine
+    business_minutes_per_week = 5 * 10 * 60  # 3 000 minutes ouvrées (hyp.)
+
+    # Étape 1 : moyenne brute sur tout le calendrier
+    avg_per_min_24_7 = weekly_volume / minutes_per_week
+
+    # Étape 2 : on concentre sur les heures ouvrées
+    # (équivalent à moyenne_24_7 × business_factor)
+    avg_per_min_business = weekly_volume / business_minutes_per_week
+
+    # Étape 3 : pic intra-jour (heure la plus chargée vs moyenne ouvrée)
+    peak_per_min = avg_per_min_business * peak_factor
+
+    # Étape 4 : marge de sécurité pour le test
+    peak_with_safety = peak_per_min * safety_factor
+
+    return {
+        "volume_hebdo": weekly_volume,
+        "moyenne_24_7_par_min": avg_per_min_24_7,
+        "moyenne_ouvree_par_min": avg_per_min_business,
+        "pic_ouvre_par_min": peak_per_min,
+        "pic_cible_test_perf_par_min": peak_with_safety,
+        "pic_cible_test_perf_par_sec": peak_with_safety / 60,
+    }
+
+
+# =============================================================================
+# AGRÉGATION SÉRIE TEMPORELLE (plusieurs payloads)
+# =============================================================================
+
+def aggregate_timeseries(volumes: list[int]) -> dict[str, float]:
+    """
+    À partir d'une liste de volumes hebdomadaires (un par payload collecté),
+    calcule des statistiques pour identifier la semaine la plus chargée et
+    la variabilité.
+
+    Pour le calibrage : on utilise le MAX comme base, pas la moyenne.
+    Un test de perf doit tenir le pire cas observé, pas la moyenne.
+    """
+    if not volumes:
+        return {}
+    return {
+        "n_semaines": len(volumes),
+        "min": min(volumes),
+        "max": max(volumes),
+        "moyenne": statistics.mean(volumes),
+        "mediane": statistics.median(volumes),
+        # Écart-type : seulement si on a au moins 2 points.
+        "ecart_type": statistics.stdev(volumes) if len(volumes) > 1 else 0,
+    }
+
+
+# =============================================================================
+# RAPPORT TEXTE
+# =============================================================================
+
+def print_header(payloads_info: list[dict]) -> None:
+    """Affiche l'en-tête du rapport avec les métadonnées des payloads."""
+    print("=" * 78)
+    print(" CALIBRAGE TEST DE PERF GITLAB — depuis payload Service Ping")
+    print("=" * 78)
+    for i, p in enumerate(payloads_info, 1):
+        print(f"  Payload #{i} : {p['hostname']:30s} | "
+              f"recorded_at={p['recorded_at']} | version={p['version']}")
+    if payloads_info:
+        last = payloads_info[-1]
+        print(f"  Utilisateurs actifs (dernier payload) : {last.get('active_user_count', 'inconnu')}")
+    print()
+
+
+def print_event_report(event_name: str, info: dict) -> None:
+    """Affiche le rapport détaillé pour un event métier."""
+    print(f"┌─ {event_name.upper()} " + "─" * (74 - len(event_name)))
+
+    if not info["matches"]:
+        print("│  ⚠️  Aucune clé trouvée dans le payload.")
+        print("│     → Ajustez EVENT_PATTERNS dans le script, puis relancez.")
+        print(f"│     → Utilisez --list-keys pour voir les clés *weekly disponibles.")
+        print("└" + "─" * 77)
+        print()
+        return
+
+    print("│  Clés détectées dans le payload :")
+    for key, value in info["matches"]:
+        print(f"│    • {key} = {value:,}")
+
+    # Si on a une série temporelle, on affiche les stats d'agrégation
+    if info.get("timeseries_stats"):
+        ts = info["timeseries_stats"]
+        print(f"│")
+        print(f"│  Série temporelle ({ts['n_semaines']} semaines) :")
+        print(f"│    min={ts['min']:,.0f}  max={ts['max']:,.0f}  "
+              f"moyenne={ts['moyenne']:,.0f}  médiane={ts['mediane']:,.0f}")
+        print(f"│    écart-type={ts['ecart_type']:,.0f} "
+              f"(variabilité : {ts['ecart_type']/ts['moyenne']*100 if ts['moyenne'] else 0:.0f}%)")
+        print(f"│    → Base de calibrage : MAX = {ts['max']:,.0f} events/semaine")
+
+    m = info["metrics"]
+    print(f"│")
+    print(f"│  Volume retenu pour calibrage : {m['volume_hebdo']:>12,.0f}  events/semaine")
+    print(f"│  Moyenne brute 24/7           : {m['moyenne_24_7_par_min']:>12.2f}  events/min")
+    print(f"│  Moyenne heures ouvrées       : {m['moyenne_ouvree_par_min']:>12.2f}  events/min")
+    print(f"│  Pic estimé heure de pointe   : {m['pic_ouvre_par_min']:>12.2f}  events/min")
+    print(f"│  ➜  CIBLE TEST DE PERF        : {m['pic_cible_test_perf_par_min']:>12.2f}  events/min")
+    print(f"│     soit                       {m['pic_cible_test_perf_par_sec']:>12.2f}  events/sec")
+    print("└" + "─" * 77)
+    print()
+
+
+def print_footer(business_factor: float, peak_factor: float, safety_factor: float) -> None:
+    """Affiche le pied de rapport avec les hypothèses utilisées."""
+    print("=" * 78)
+    print(" HYPOTHÈSES UTILISÉES (modifiables via CLI)")
+    print("=" * 78)
+    print(f"  Concentration heures ouvrées : ×{business_factor}  "
+          f"(--business-factor)")
+    print(f"  Pic intra-jour vs moyenne     : ×{peak_factor}  "
+          f"(--peak-factor)")
+    print(f"  Marge sécurité                : ×{safety_factor}  "
+          f"(--safety)")
+    print(f"  Facteur peak/moyenne total    : ×{business_factor * peak_factor * safety_factor:.1f}")
+    print("=" * 78)
+    print()
+    print(" NOTES IMPORTANTES :")
+    print("  • Les valeurs ne reflètent PAS la distribution par projet")
+    print("    (loi de Pareto invisible). Pour le réalisme du test, croiser")
+    print("    avec les API /events et /pipelines sur les top projets actifs.")
+    print("  • L'event 'deployment' agrège promote ET demote. Si vous voulez")
+    print("    les séparer, hypothèse classique : 80% promote / 20% demote.")
+    print("  • L'event 'push branche défaut' utilise les pipelines de source push")
+    print("    comme proxy. Sous-estime les pushs sans CI.")
+    print()
+
+
+# =============================================================================
+# MODE EXPLORATION : lister les clés *weekly disponibles
+# =============================================================================
+
+def list_weekly_keys(flat_payload: dict[str, Any]) -> None:
+    """
+    Liste toutes les clés du payload qui contiennent 'weekly'.
+    Utile pour identifier les vraies clés de VOTRE version GitLab
+    et ajuster EVENT_PATTERNS en conséquence.
+    """
+    weekly_keys = sorted(k for k in flat_payload if "weekly" in k.lower())
+    print(f"# {len(weekly_keys)} clés contenant 'weekly' dans le payload :")
+    print()
+    for k in weekly_keys:
+        v = flat_payload[k]
+        # On masque les valeurs trop longues pour garder le terminal lisible
+        v_repr = repr(v) if len(repr(v)) < 50 else repr(v)[:47] + "..."
+        print(f"  {k:60s} = {v_repr}")
+
+
+# =============================================================================
+# POINT D'ENTRÉE
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Calibrage d'un test de perf GitLab depuis le payload Service Ping",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "payloads",
+        nargs="+",
+        help="Un ou plusieurs fichiers JSON de payload (série temporelle si N>1)",
+    )
+    parser.add_argument(
+        "--list-keys",
+        action="store_true",
+        help="Mode exploration : liste les clés *weekly du premier payload et sort.",
+    )
+    parser.add_argument(
+        "--business-factor",
+        type=float,
+        default=DEFAULT_BUSINESS_HOURS_FACTOR,
+        help=f"Facteur concentration heures ouvrées (défaut: {DEFAULT_BUSINESS_HOURS_FACTOR})",
+    )
+    parser.add_argument(
+        "--peak-factor",
+        type=float,
+        default=DEFAULT_PEAK_HOURLY_FACTOR,
+        help=f"Facteur pic intra-jour (défaut: {DEFAULT_PEAK_HOURLY_FACTOR})",
+    )
+    parser.add_argument(
+        "--safety",
+        type=float,
+        default=DEFAULT_SAFETY_FACTOR,
+        help=f"Marge de sécurité (défaut: {DEFAULT_SAFETY_FACTOR})",
+    )
+    args = parser.parse_args()
+
+    # Chargement des payloads (1 ou plusieurs)
+    payloads = [load_payload(p) for p in args.payloads]
+    flat_payloads = [flatten_dict(p) for p in payloads]
+
+    # Mode exploration : on liste les clés et on s'arrête là
+    if args.list_keys:
+        list_weekly_keys(flat_payloads[0])
+        return
+
+    # Métadonnées des payloads pour l'en-tête
+    payloads_info = [
+        {
+            "hostname": p.get("hostname", "inconnu"),
+            "recorded_at": p.get("recorded_at", "inconnu"),
+            "version": p.get("version", "inconnue"),
+            "active_user_count": p.get("active_user_count"),
+        }
+        for p in payloads
+    ]
+
+    # Pour chaque event métier : on cherche les clés dans chaque payload,
+    # on agrège les volumes en série temporelle s'il y en a plusieurs,
+    # puis on calcule les métriques de charge.
+    events_data = {}
+    for event_name, patterns in EVENT_PATTERNS.items():
+        # On cherche les clés dans chaque payload
+        all_matches_per_payload = [
+            find_matching_keys(flat, patterns) for flat in flat_payloads
+        ]
+
+        # Volume par payload = somme des valeurs des clés matchées
+        # (ex: si notes_created_weekly ET notes_updated_weekly matchent,
+        #  on les additionne)
+        volumes_per_payload = [
+            sum(v for _, v in matches) for matches in all_matches_per_payload
+        ]
+
+        # En mode multi-payloads, on prend le MAX comme base de calibrage.
+        # Sinon, le volume du seul payload disponible.
+        if len(volumes_per_payload) > 1:
+            timeseries_stats = aggregate_timeseries(volumes_per_payload)
+            volume_to_use = timeseries_stats["max"]
+        else:
+            timeseries_stats = None
+            volume_to_use = volumes_per_payload[0] if volumes_per_payload else 0
+
+        events_data[event_name] = {
+            # Pour l'affichage on prend les clés du dernier payload
+            "matches": all_matches_per_payload[-1] if all_matches_per_payload else [],
+            "timeseries_stats": timeseries_stats,
+            "metrics": compute_load_metrics(
+                volume_to_use,
+                business_factor=args.business_factor,
+                peak_factor=args.peak_factor,
+                safety_factor=args.safety,
+            ),
+        }
+
+    # Production du rapport
+    print_header(payloads_info)
+    for event_name, info in events_data.items():
+        print_event_report(event_name, info)
+    print_footer(args.business_factor, args.peak_factor, args.safety)
+
+
+if __name__ == "__main__":
+    main()
